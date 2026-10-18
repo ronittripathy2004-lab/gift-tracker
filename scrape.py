@@ -101,9 +101,17 @@ def main():
     if not rows:
         raise SystemExit("No fund cards found - page layout may have changed.")
 
-    cols = ["plan", "fund_name", "category"] + LABELS + ["url", "fetched_at", "raw_text"]
+    # Clean file: just what you need in Excel
+    clean_cols = ["fund_name", "1W returns", "1M returns", "3M returns", "All returns"]
     with open("funds.csv", "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
+        w = csv.DictWriter(f, fieldnames=clean_cols, extrasaction="ignore")
+        w.writeheader()
+        w.writerows(rows)
+
+    # Full file: everything, kept for debugging
+    full_cols = ["plan", "fund_name", "category"] + LABELS + ["url", "fetched_at", "raw_text"]
+    with open("funds_raw.csv", "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=full_cols, extrasaction="ignore")
         w.writeheader()
         w.writerows(rows)
     print(f"Saved {len(rows)} rows")
