@@ -12,7 +12,7 @@ from playwright.sync_api import sync_playwright
 
 URL = "https://getbelong.com/tools/gift-city-mutual-funds/"
 LABELS = ["Min Invest.", "Addl. Inv.", "1W returns", "1M returns", "3M returns", "All returns"]
-PLANS = ["Regular Funds", "Direct Funds"]
+PLANS = ["Regular Funds"]
 
 
 def parse_card(text):
@@ -40,6 +40,33 @@ def parse_card(text):
     return row
 
 
+def dismiss_popups(page):
+    """The site shows a full-screen overlay popup that blocks clicks. Close it."""
+    try:
+        page.keyboard.press("Escape")
+        page.wait_for_timeout(500)
+    except Exception:
+        pass
+    # Remove any fixed full-screen overlay still on the page
+    page.evaluate(
+        """() => {
+            document.querySelectorAll('div[class*="fixed"][class*="z-[500]"]')
+                .forEach(el => el.remove());
+            document.body.style.overflow = 'auto';
+        }"""
+    )
+    page.wait_for_timeout(500)
+
+
+def select_plan(page, plan):
+    btn = page.get_by_role("radio", name=plan)
+    if btn.get_attribute("aria-checked") == "true":
+        return  # already selected, nothing to click
+    dismiss_popups(page)
+    # JS click works even if something is sitting on top of the button
+    btn.evaluate("el => el.click()")
+
+
 def main():
     rows = []
     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
@@ -49,9 +76,10 @@ def main():
         page = browser.new_page(viewport={"width": 1400, "height": 1000})
         page.goto(URL, wait_until="networkidle", timeout=60000)
         page.wait_for_timeout(3000)  # let numbers finish loading
+        dismiss_popups(page)
 
         for plan in PLANS:
-            page.get_by_text(plan, exact=True).first.click()
+            select_plan(page, plan)
             page.wait_for_timeout(2000)
             cards = page.locator('a[href*="/tools/gift-city-mutual-funds/"]')
             for i in range(cards.count()):
@@ -66,10 +94,7 @@ def main():
                 row["url"] = href
                 row["fetched_at"] = stamp
                 rows.append(row)
-            if plan == PLANS[0]:
-                page.screenshot(path="screenshot_regular.png", full_page=True)
-            else:
-                page.screenshot(path="screenshot_direct.png", full_page=True)
+            page.screenshot(path="screenshot_regular.png", full_page=True)
 
         browser.close()
 
