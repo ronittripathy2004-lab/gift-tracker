@@ -1,0 +1,1461 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+generate_factsheets.py
+======================
+Reads the fund data workbook (one sheet per fund) plus riskometer / QR / logo
+images and writes ONE combined, vector-quality A4 PDF: three pages per fund,
+funds in workbook tab order.
+
+    pip install reportlab openpyxl pillow
+    python3 generate_factsheets.py                       # uses the paths in CONFIG
+    python3 generate_factsheets.py --check               # validate only, no PDF
+    python3 generate_factsheets.py --excel data.xlsx --out Sep2026.pdf --start-page 22
+
+Design rules (as briefed)
+-------------------------
+  * ALL text is pure black (#000000).
+  * Page background is cream  #FBF0E8  (251,240,232).
+  * Charts / header bars / buttons use gold  #BE9036  (190,144,54).
+  * Rules, borders, the 2nd chart series use navy  #08132D  (8,19,45).
+  * No other colour is ever painted by this script (images keep their own colours).
+
+Image naming (case-insensitive; .png / .jpg / .jpeg; spaces/underscores are interchangeable)
+  Riskometer folder :  <Sheet>_scheme_riskometer   (or just <Sheet>)
+                       <Sheet>_benchmark_riskometer
+  QR Code folder    :  <Sheet>_qr   (or just <Sheet>)
+  Logo              :  logo.png/jpg in the Factsheet folder (or Logo/ subfolder, or --logo)
+  <Sheet> is the workbook tab name; the fund's printed name is also tried.
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import math
+import os
+import re
+import sys
+import unicodedata
+from decimal import Decimal, ROUND_HALF_UP
+from pathlib import Path
+
+import openpyxl
+from openpyxl.utils import get_column_letter
+from PIL import Image, ImageChops, ImageOps
+from reportlab.lib.colors import HexColor
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.utils import ImageReader
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.pdfgen import canvas
+
+# =============================================================================
+# CONFIG  (edit paths here, or override on the command line)
+# =============================================================================
+BASE_DIR = Path("/Users/ronittripathy/Desktop/Factsheet")
+EXCEL_PATH = BASE_DIR / "factsheet_data.xlsx"
+QR_DIR = BASE_DIR / "QR Code"
+RISK_DIR = BASE_DIR / "Riskometer"
+LOGO_PATH = None                         # None = auto-search (see docstring)
+OUTPUT_PDF = BASE_DIR / "Factsheets.pdf"
+START_PAGE = 1                           # printed number of the first page
+
+# The riskometer pictures: does the script add the fund name above and the
+# "This risk of the scheme is very high." line below?  Set False if your
+# riskometer images already contain that text.
+RISKOMETER_CAPTIONS = True
+# Multiply images by the cream background so white image backgrounds become
+# cream (seamless).  Set False to keep image pixels untouched.
+BLEND_IMAGES_TO_CREAM = True
+
+# ---- brand palette (the ONLY colours painted by this script) ----------------
+BLACK = HexColor("#000000")
+CREAM = HexColor("#FBF0E8")
+GOLD = HexColor("#BE9036")
+NAVY = HexColor("#08132D")
+CREAM_RGB = (251, 240, 232)
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+RISK_LEVELS = ["Low", "Low to Moderate", "Moderate", "Moderately High", "High", "Very High"]
+
+# =============================================================================
+# Issue log  (errors stop the build, warnings are reported)
+# =============================================================================
+ISSUES: list[tuple[str, str, str]] = []
+_CTX = ["-"]
+
+
+def err(msg):
+    ISSUES.append(("ERROR", _CTX[0], msg))
+
+
+def warn(msg):
+    ISSUES.append(("WARN", _CTX[0], msg))
+
+
+# =============================================================================
+# Fonts  (need a Unicode font with the rupee sign; Arial on macOS qualifies)
+# =============================================================================
+FONT_REG, FONT_BOLD = "FS-Regular", "FS-Bold"
+RUPEE = "\u20b9"
+_GLYPHS: set[int] = set()
+
+_FONT_PAIRS = [
+    ("Arial.ttf", "Arial Bold.ttf"),
+    ("arial.ttf", "arialbd.ttf"),
+    ("LiberationSans-Regular.ttf", "LiberationSans-Bold.ttf"),
+    ("NotoSans-Regular.ttf", "NotoSans-Bold.ttf"),
+    ("DejaVuSans.ttf", "DejaVuSans-Bold.ttf"),
+]
+_FONT_DIRS = [
+    SCRIPT_DIR / "fonts",
+    SCRIPT_DIR,
+    Path("/System/Library/Fonts/Supplemental"),
+    Path("/Library/Fonts"),
+    Path.home() / "Library/Fonts",
+    Path("/usr/share/fonts/truetype/liberation"),
+    Path("/usr/share/fonts/truetype/dejavu"),
+    Path("C:/Windows/Fonts"),
+]
+
+
+def _has_rupee(path: Path) -> bool:
+    try:
+        return 0x20B9 in TTFont("probe", str(path)).face.charToGlyph
+    except Exception:
+        return False
+
+
+def register_fonts():
+    global RUPEE
+    fallback = None
+    for d in _FONT_DIRS:
+        for r, b in _FONT_PAIRS:
+            pr, pb = d / r, d / b
+            if not (pr.exists() and pb.exists()):
+                continue
+            if _has_rupee(pr) and _has_rupee(pb):
+                _install(pr, pb)
+                print(f"Font : {pr.name} / {pb.name}  ({d})")
+                return
+            fallback = fallback or (pr, pb)
+    if fallback:
+        _install(*fallback)
+        RUPEE = "Rs."
+        warn(f"Font {fallback[0].name} has no rupee glyph; printing 'Rs.' instead. "
+             f"Put NotoSans-Regular.ttf and NotoSans-Bold.ttf in {SCRIPT_DIR / 'fonts'} for the \u20b9 sign.")
+        return
+    sys.exit(f"No usable TrueType font found. Create the folder {SCRIPT_DIR / 'fonts'} and put "
+             "NotoSans-Regular.ttf and NotoSans-Bold.ttf (free from Google Fonts) in it.")
+
+
+def _install(pr: Path, pb: Path):
+    pdfmetrics.registerFont(TTFont(FONT_REG, str(pr)))
+    pdfmetrics.registerFont(TTFont(FONT_BOLD, str(pb)))
+    _GLYPHS.update(pdfmetrics.getFont(FONT_REG).face.charToGlyph.keys())
+
+
+_MISSING: set[str] = set()
+
+
+def clean(s: str) -> str:
+    s = unicodedata.normalize("NFC", s)
+    s = s.replace("\u00a0", " ").replace("\u200b", "").replace("\t", " ")
+    s = re.sub(r"[ ]{2,}", " ", s).strip()
+    if RUPEE != "\u20b9":
+        s = s.replace("\u20b9", RUPEE)
+    return s
+
+
+# =============================================================================
+# Number / date formatting
+# =============================================================================
+MONTHS = ["January", "February", "March", "April", "May", "June", "July",
+          "August", "September", "October", "November", "December"]
+
+
+def f_fixed(x, d):
+    q = Decimal(1).scaleb(-d)
+    r = Decimal(repr(float(x))).quantize(q, ROUND_HALF_UP)
+    if r == 0:
+        r = abs(r)
+    return f"{r:.{d}f}"
+
+
+def indian(x, d=0):
+    s = f_fixed(x, d)
+    neg = s.startswith("-")
+    s = s.lstrip("-")
+    ip, _, fp = s.partition(".")
+    if len(ip) > 3:
+        head, tail = ip[:-3], ip[-3:]
+        parts = []
+        while len(head) > 2:
+            parts.insert(0, head[-2:])
+            head = head[:-2]
+        if head:
+            parts.insert(0, head)
+        ip = ",".join(parts + [tail])
+    return ("-" if neg else "") + ip + ("." + fp if fp else "")
+
+
+def pct(x, d=2):
+    return "NA" if x is None else f_fixed(x, d) + "%"
+
+
+def plain(x, d=2):
+    return "NA" if x is None else f_fixed(x, d)
+
+
+def d_long(d):      # 09 August 2005
+    return f"{d.day:02d} {MONTHS[d.month - 1]} {d.year}"
+
+
+def d_us(d):        # September 30, 2026
+    return f"{MONTHS[d.month - 1]} {d.day:02d}, {d.year}"
+
+
+def d_short(d):     # Aug 09, 2005
+    return f"{MONTHS[d.month - 1][:3]} {d.day:02d}, {d.year}"
+
+
+def num_text(x):
+    if x is None:
+        return "NA"
+    return str(int(x)) if float(x).is_integer() else f"{x:g}"
+
+
+# =============================================================================
+# Text engine  (wrapping, superscript footnote marks, black text)
+# =============================================================================
+SUP = 0.58
+_SUP_RE = re.compile(r"(?<=[^\s$\u00a3#@^])([$\u00a3#@^]+)")
+
+
+def segs(text):
+    out, pos = [], 0
+    for m in _SUP_RE.finditer(text):
+        if m.start() > pos:
+            out.append((text[pos:m.start()], False))
+        out.append((m.group(1), True))
+        pos = m.end()
+    if pos < len(text):
+        out.append((text[pos:], False))
+    return out or [("", False)]
+
+
+def _check_glyphs(text):
+    for ch in text:
+        if ord(ch) not in _GLYPHS and ch not in "\n" and ord(ch) > 31:
+            _MISSING.add(ch)
+
+
+def rw(text, font, size):
+    _check_glyphs(text)
+    return sum(pdfmetrics.stringWidth(t, font, size * (SUP if sp else 1)) for t, sp in segs(text))
+
+
+def wrap(text, font, size, width, first_indent=0.0):
+    out: list[str] = []
+    width = max(width, 12)
+
+    def avail():
+        return max(width - (first_indent if not out else 0), 12)
+
+    for para in str(text).split("\n"):
+        cur = ""
+        for wd in para.split():
+            while rw(wd, font, size) > avail():
+                if cur:
+                    out.append(cur)
+                    cur = ""
+                    continue
+                k = len(wd)
+                while k > 1 and rw(wd[:k], font, size) > avail():
+                    k -= 1
+                out.append(wd[:k])
+                wd = wd[k:]
+            trial = f"{cur} {wd}" if cur else wd
+            if rw(trial, font, size) <= avail():
+                cur = trial
+            else:
+                out.append(cur)
+                cur = wd
+        out.append(cur)
+    return out or [""]
+
+
+class Painter:
+    """Thin wrapper over the canvas.  When .dry is True nothing is drawn, so every
+    builder can first *measure* itself, then draw."""
+
+    def __init__(self, c):
+        self.c = c
+        self.dry = False
+
+    # -- primitives ---------------------------------------------------------
+    def fill_page(self):
+        self.c.setFillColor(CREAM)
+        self.c.rect(0, 0, W, H, stroke=0, fill=1)
+
+    def txt(self, x, y, s, font, size, align="l"):
+        if self.dry or not s:
+            return
+        c = self.c
+        total = rw(s, font, size)
+        if align == "r":
+            x -= total
+        elif align == "c":
+            x -= total / 2
+        c.setFillColor(BLACK)
+        for t, sp in segs(s):
+            if sp:
+                c.setFont(font, size * SUP)
+                c.drawString(x, y + size * 0.38, t)
+                x += pdfmetrics.stringWidth(t, font, size * SUP)
+            else:
+                c.setFont(font, size)
+                c.drawString(x, y, t)
+                x += pdfmetrics.stringWidth(t, font, size)
+
+    def rect(self, x, top, w, h, fill=None, stroke=NAVY, lw=0.6, radius=0):
+        if self.dry:
+            return
+        c = self.c
+        if fill is not None:
+            c.setFillColor(fill)
+        if stroke is not None:
+            c.setStrokeColor(stroke)
+            c.setLineWidth(lw)
+        if radius:
+            c.roundRect(x, top - h, w, h, radius, stroke=int(stroke is not None), fill=int(fill is not None))
+        else:
+            c.rect(x, top - h, w, h, stroke=int(stroke is not None), fill=int(fill is not None))
+
+    def line(self, x1, y1, x2, y2, lw=0.4, dash=None):
+        if self.dry:
+            return
+        c = self.c
+        c.setStrokeColor(NAVY)
+        c.setLineWidth(lw)
+        c.setDash(dash or [])
+        c.line(x1, y1, x2, y2)
+        c.setDash([])
+
+    def link(self, url, x, top, w, h):
+        if self.dry or not url:
+            return
+        self.c.linkURL(url, (x, top - h, x + w, top), relative=0, thickness=0)
+
+    def image(self, im, x, ybot, w, h):
+        if self.dry:
+            return
+        self.c.drawImage(im, x, ybot, w, h, mask=None)
+
+    # -- text blocks --------------------------------------------------------
+    def para(self, x, top, w, text, font, size, lead=None, align="l", first_indent=0.0):
+        lead = lead or size * 1.25
+        lines = wrap(text, font, size, w, first_indent)
+        for i, ln in enumerate(lines):
+            base = top - i * lead - lead * 0.5 - size * 0.35
+            off = first_indent if i == 0 else 0
+            if align == "l":
+                self.txt(x + off, base, ln, font, size)
+            elif align == "c":
+                self.txt(x + w / 2, base, ln, font, size, "c")
+            else:
+                self.txt(x + w, base, ln, font, size, "r")
+        return len(lines) * lead
+
+
+def bar(P, x, top, w, title, s, bump=0.7):
+    size = s + bump
+    lines = wrap(title, FONT_BOLD, size, w - 8)
+    lead = size * 1.2
+    h = len(lines) * lead + 6.0
+    P.rect(x, top, w, h, fill=GOLD, stroke=NAVY, lw=0.8)
+    for i, ln in enumerate(lines):
+        P.txt(x + w / 2, top - 3.0 - i * lead - lead / 2 - size * 0.35, ln, FONT_BOLD, size, "c")
+    return h
+
+
+def kv_row(P, x, top, w, label, value, s, lab_frac=0.55, bold_label=True, bold_value=False, pady=2.0):
+    lead = s * 1.28
+    lf = FONT_BOLD if bold_label else FONT_REG
+    vf = FONT_BOLD if bold_value else FONT_REG
+    lw_ = min(rw(label, lf, s) + 5, w * lab_frac)      # label column: natural width, capped
+    vw = w - lw_ - 3
+    ll = wrap(label, lf, s, lw_ - 1)
+    vl = wrap(value, vf, s, vw)
+    n = max(len(ll), len(vl))
+    for i, ln in enumerate(ll):
+        P.txt(x, top - pady - i * lead - lead / 2 - s * 0.35, ln, lf, s)
+    for i, ln in enumerate(vl):
+        P.txt(x + w, top - pady - i * lead - lead / 2 - s * 0.35, ln, vf, s, "r")
+    return n * lead + 2 * pady
+
+
+def text_row(P, x, top, w, text, s, bold=False, indent=0.0, pady=2.0, align="l"):
+    f = FONT_BOLD if bold else FONT_REG
+    h = P.para(x + indent, top - pady, w - indent, text, f, s, lead=s * 1.28, align=align)
+    return h + 2 * pady
+
+
+# =============================================================================
+# Generic table
+# =============================================================================
+class Cell:
+    def __init__(self, text="", bold=None, align=None, link=None, img=None, img_h=0.0,
+                 span=1, underline=False):
+        self.text, self.bold, self.align, self.link = text, bold, align, link
+        self.img, self.img_h, self.span, self.underline = img, img_h, span, underline
+
+
+def table(P, x, top, widths, header, rows, s, aligns=None, title=None, padx=3.0, pady=2.3,
+          bold_first_col=False):
+    w = sum(widths)
+    lead = s * 1.22
+    y = top
+    aligns = aligns or ["l"] * len(widths)
+    if title:
+        y -= bar(P, x, y, w, title, s)
+    top_body = y
+    items = [(r, True) for r in header] + [(r, False) for r in rows]
+    for r, is_h in items:
+        cells, col = [], 0
+        for cell in r:
+            cell = cell if isinstance(cell, Cell) else Cell(str(cell))
+            cells.append((cell, col, cell.span))
+            col += cell.span
+        # height
+        rh = 0.0
+        prepared = []
+        for cell, c0, sp in cells:
+            cw = sum(widths[c0:c0 + sp])
+            bold = cell.bold if cell.bold is not None else (is_h or (bold_first_col and c0 == 0))
+            font = FONT_BOLD if bold else FONT_REG
+            lines = wrap(cell.text, font, s, cw - 2 * padx) if cell.text else []
+            hh = len(lines) * lead + 2 * pady if lines else 0
+            if cell.img is not None:
+                hh = max(hh, cell.img_h + 2 * pady)
+            rh = max(rh, hh)
+            prepared.append((cell, c0, sp, cw, font, lines))
+        rh = max(rh, lead + 2 * pady)
+        if not P.dry:
+            for cell, c0, sp, cw, font, lines in prepared:
+                cx = x + sum(widths[:c0])
+                al = cell.align or ("c" if is_h else aligns[c0])
+                block = len(lines) * lead
+                y0 = y - (rh - block) / 2
+                for i, ln in enumerate(lines):
+                    base = y0 - i * lead - lead / 2 - s * 0.35
+                    if al == "l":
+                        P.txt(cx + padx, base, ln, font, s)
+                        lx0, lx1 = cx + padx, cx + padx + rw(ln, font, s)
+                    elif al == "c":
+                        P.txt(cx + cw / 2, base, ln, font, s, "c")
+                        lx0, lx1 = cx + cw / 2 - rw(ln, font, s) / 2, cx + cw / 2 + rw(ln, font, s) / 2
+                    else:
+                        P.txt(cx + cw - padx, base, ln, font, s, "r")
+                        lx0, lx1 = cx + cw - padx - rw(ln, font, s), cx + cw - padx
+                    if cell.underline and ln:
+                        P.line(lx0, base - 1.6, lx1, base - 1.6, lw=0.5)
+                if cell.img is not None:
+                    im, aspect = cell.img
+                    bw, bh = cw - 2 * padx, cell.img_h
+                    dw, dh = (bh * aspect, bh) if bh * aspect <= bw else (bw, bw / aspect)
+                    P.image(im, cx + (cw - dw) / 2, y - (rh - dh) / 2 - dh, dw, dh)
+                if cell.link:
+                    P.link(cell.link, cx, y, cw, rh)
+                if c0 > 0:
+                    P.line(cx, y, cx, y - rh, 0.4)
+            P.line(x, y - rh, x + w, y - rh, 0.9 if is_h else 0.4)
+        y -= rh
+    P.rect(x, top_body, w, top_body - y, fill=None, stroke=NAVY, lw=0.8)
+    return top - y
+
+
+# =============================================================================
+# Images
+# =============================================================================
+_IMG_CACHE: dict = {}
+
+
+def prepare_image(path: Path, box_w, box_h, kind="art"):
+    key = (str(path), round(box_w), round(box_h), kind)
+    if key in _IMG_CACHE:
+        return _IMG_CACHE[key]
+    im = Image.open(path)
+    im = ImageOps.exif_transpose(im)
+    if im.mode in ("RGBA", "LA") or (im.mode == "P" and "transparency" in im.info):
+        im = im.convert("RGBA")
+        bg = Image.new("RGBA", im.size, (255, 255, 255, 255))
+        im = Image.alpha_composite(bg, im)
+    im = im.convert("RGB")
+    if BLEND_IMAGES_TO_CREAM:
+        im = ImageChops.multiply(im, Image.new("RGB", im.size, CREAM_RGB))
+    if kind == "qr":
+        if min(im.size) < 600:
+            f = math.ceil(600 / min(im.size))
+            im = im.resize((im.width * f, im.height * f), Image.NEAREST)
+    else:
+        tw, th = box_w / 72 * 300, box_h / 72 * 300
+        sc = min(tw / im.width, th / im.height)
+        if sc < 0.67:
+            im = im.resize((max(1, int(im.width * sc)), max(1, int(im.height * sc))), Image.LANCZOS)
+    res = (ImageReader(im), im.width / im.height)
+    _IMG_CACHE[key] = res
+    return res
+
+
+def _norm(s: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", unicodedata.normalize("NFC", s).lower()).strip()
+
+
+def index_dir(d: Path) -> dict[str, Path]:
+    idx: dict[str, Path] = {}
+    if not d.is_dir():
+        return idx
+    for p in sorted(d.iterdir()):
+        if p.suffix.lower() in (".png", ".jpg", ".jpeg") and not p.name.startswith("."):
+            idx.setdefault(_norm(p.stem), p)
+    return idx
+
+
+def find_image(idx, bases, suffixes):
+    for b in bases:
+        if not b:
+            continue
+        for suf in suffixes:
+            k = _norm(f"{b} {suf}")
+            if k in idx:
+                return idx[k]
+    return None
+
+
+# =============================================================================
+# Workbook reader
+# =============================================================================
+class Sheet:
+    def __init__(self, ws):
+        self.ws = ws
+        self.name = ws.title
+        self.placeholders = []
+        self.row = {}
+        for r in range(1, ws.max_row + 1):
+            k = ws.cell(r, 1).value
+            if isinstance(k, str) and k.strip() and k.strip() != "key":
+                self.row[k.strip()] = r
+
+    def raw(self, key, col=3):
+        r = self.row.get(key)
+        return None if r is None else self.ws.cell(r, col).value
+
+    def addr(self, key, col=3):
+        r = self.row.get(key)
+        return f"{get_column_letter(col)}{r}" if r else f"[{key}]"
+
+    def txt(self, key, col=3, required=False):
+        v = self.raw(key, col)
+        if v is None:
+            s = ""
+        elif isinstance(v, float) and v.is_integer():
+            s = str(int(v))
+        elif isinstance(v, (dt.datetime, dt.date)):
+            s = v.strftime("%d/%m/%Y")
+        else:
+            s = str(v)
+        s = clean(s)
+        if required and not s:
+            err(f"{self.addr(key, col)} ({key}) is required but empty")
+        return s
+
+    def num(self, key, col=3, required=False, lo=None, hi=None):
+        v = self.raw(key, col)
+        if v is None or (isinstance(v, str) and not v.strip()):
+            if required:
+                err(f"{self.addr(key, col)} ({key}) is required but empty")
+            return None
+        try:
+            if isinstance(v, str):
+                t = v.strip().replace(",", "").replace("%", "").replace("\u20b9", "").strip()
+                if t.upper() in ("NA", "N/A", "-", "\u2013"):
+                    return None
+                v = float(t)
+            v = float(v)
+        except (TypeError, ValueError):
+            err(f"{self.addr(key, col)} ({key}): '{v}' is not a number")
+            return None
+        if math.isnan(v):
+            return None
+        if (lo is not None and v < lo) or (hi is not None and v > hi):
+            err(f"{self.addr(key, col)} ({key}): {v} is outside the plausible range {lo}..{hi}")
+        return v
+
+    def date(self, key, col=3, required=False):
+        v = self.raw(key, col)
+        if isinstance(v, dt.datetime):
+            return v.date()
+        if isinstance(v, dt.date):
+            return v
+        if isinstance(v, str) and v.strip():
+            for f in ("%d/%m/%Y", "%d-%m-%Y", "%Y-%m-%d", "%d %B %Y", "%d %b %Y", "%B %d, %Y"):
+                try:
+                    return dt.datetime.strptime(v.strip(), f).date()
+                except ValueError:
+                    pass
+            err(f"{self.addr(key, col)} ({key}): '{v}' is not a valid date (use a real Excel date)")
+            return None
+        if required:
+            err(f"{self.addr(key, col)} ({key}) is required but empty")
+        return None
+
+    def url(self, key):
+        u = self.txt(key)
+        if not u:
+            return ""
+        if not re.match(r"^https?://\S+$", u, re.I):
+            err(f"{self.addr(key)} ({key}): '{u}' is not a full URL starting with http(s)://")
+            return ""
+        if "example.com" in u.lower() or u.endswith("..."):
+            self.placeholders.append(self.addr(key))
+        return u
+
+
+PERIODS = [("perf.6M", "6 Months"), ("perf.1Y", "1 Year"), ("perf.3Y", "3 Years"),
+           ("perf.5Y", "5 Years"), ("perf.10Y", "10 Years"), ("perf.SI", "Since inception")]
+
+WEB_NAMES = ["Video Explainer", "Calculation/Methodology", "Detailed Risk Factors",
+             "SID", "Investor Services", "Grievance submission and redressal"]
+
+FOOT_ORDER = ["common.fn.perf", "fund.other_funds_note", "common.fn.plans", "common.fn.plan_perf",
+              "common.fn.riskfree", "common.fn.turnover", "common.fn.benchmark", "common.fn.idcw",
+              "common.fn.sip", "common.fn.cash", "fund.footnote_extra"]
+
+
+class Fund:
+    pass
+
+
+def parse_fund(ws, qr_idx, risk_idx) -> Fund:
+    S = Sheet(ws)
+    F = Fund()
+    F.sheet = S.name
+    F.key = S.name
+    required_keys = ["report.month", "report.asof", "fund.name", "nav.reg_growth", "perf.1Y", "alloc.1",
+                     "top.1", "rm.scheme", "ter.regular", "fm.1", "common.past_perf"]
+    for k in required_keys:
+        if k not in S.row:
+            err(f"key '{k}' not found in column A - the sheet no longer matches the template")
+
+    F.month = S.txt("report.month", required=True)
+    F.asof = S.date("report.asof", required=True)
+    F.amc = S.txt("report.amc")
+    F.name = S.txt("fund.name", required=True)
+    F.former = S.txt("fund.former_name")             # optional extra row
+    F.type = S.txt("fund.type", required=True)
+    F.category = S.txt("fund.category")
+    F.inception = S.date("fund.inception", required=True)
+    F.benchmark = S.txt("fund.benchmark", required=True)
+    F.addl = S.txt("fund.addl_benchmark")
+    F.about = S.txt("fund.about")
+    F.labels = [t for t in (S.txt(f"fund.label_{i}") for i in (1, 2, 3)) if t]
+    if not F.labels:
+        err("No product label bullets (fund.label_1..3) filled")
+    F.nav = []
+    for key, lab in [("nav.reg_growth", "Regular Plan - Growth Option"), ("nav.reg_idcw", "Regular Plan - IDCW Option"),
+                     ("nav.dir_growth", "Direct Plan - Growth Option"), ("nav.dir_idcw", "Direct Plan - IDCW Option")]:
+        v = S.num(key, required=(key == "nav.reg_growth"), lo=0)
+        if v is not None:
+            F.nav.append((lab, v))
+    F.aum = S.num("aum.month_end", required=True, lo=0)
+    F.aaum = S.num("aum.avg", required=True, lo=0)
+    F.fms = []
+    for i in (1, 2, 3):
+        nm = S.txt(f"fm.{i}", 3)
+        if nm:
+            ex = S.num(f"fm.{i}", 4, lo=0, hi=70)
+            since = S.date(f"fm.{i}", 5)
+            F.fms.append((nm, ex, since))
+    if not F.fms:
+        err("No fund manager filled (fm.1)")
+    F.lumpsum = S.txt("min.lumpsum", required=True)
+    F.sip = S.txt("min.sip", required=True)
+    F.sip_freq = S.txt("min.sip_freq")
+    F.sip_dates = S.txt("min.sip_dates")
+    F.options = S.txt("min.options")
+    F.load = [t for t in (S.txt(f"load.{i}") for i in range(1, 6)) if t]
+    F.ter = {"Regular": (S.num("ter.regular", 3, required=True, lo=0, hi=10), S.num("ter.regular", 4, lo=0, hi=10)),
+             "Direct": (S.num("ter.direct", 3, lo=0, hi=10), S.num("ter.direct", 4, lo=0, hi=10))}
+    F.std, F.beta = S.num("risk.std", lo=0), S.num("risk.beta")
+    F.sharpe, F.info = S.num("risk.sharpe"), S.num("risk.info")
+    F.turn_eq, F.turn_gross = S.num("turn.equity", lo=0), S.num("turn.gross", lo=0)
+
+    def level(key, required):
+        v = S.txt(key)
+        if not v:
+            if required:
+                err(f"{S.addr(key)} ({key}) riskometer level is required")
+            return ""
+        for L in RISK_LEVELS:
+            if L.lower() == v.lower():
+                return L
+        err(f"{S.addr(key)} ({key}): '{v}' is not one of {RISK_LEVELS}")
+        return ""
+
+    F.rm_scheme, F.rm_prev, F.rm_bm = level("rm.scheme", True), level("rm.scheme_prev", False), level("rm.benchmark", True)
+
+    # performance
+    F.perf = []
+    for key, default in PERIODS:
+        reg = S.num(key, 3, lo=-100, hi=1000)
+        if reg is None:
+            continue
+        lab = S.txt(key, 2) or default
+        row = dict(key=key, label=lab, reg=reg, dir=S.num(key, 4, lo=-100, hi=1000),
+                   bm=S.num(key, 5, lo=-100, hi=1000), ab=S.num(key, 6, lo=-100, hi=1000))
+        yrs = S.num(key, 10)
+        if yrs is None and key == "perf.SI" and F.asof and F.inception:
+            yrs = (F.asof - F.inception).days / 365
+        yrs = yrs if yrs else {"perf.6M": .5, "perf.1Y": 1, "perf.3Y": 3, "perf.5Y": 5, "perf.10Y": 10}.get(key, 1)
+        for col, src, dst in [(7, "reg", "v_reg"), (8, "bm", "v_bm"), (9, "ab", "v_ab")]:
+            v = S.num(key, col, lo=0)
+            if v is None and row[src] is not None:   # cached formula value missing -> same formula in Python
+                r = row[src] / 100
+                v = round(10000 * (1 + r) if yrs <= 1 else 10000 * (1 + r) ** yrs)
+            row[dst] = v
+        F.perf.append(row)
+    if not F.perf:
+        err("No performance row has a Regular return (section 7)")
+
+    # financial-year chart
+    F.fy = []
+    for i in range(1, 6):
+        lab = S.txt(f"fy.{i}", 2)
+        r, d_, b = S.num(f"fy.{i}", 3, lo=-100, hi=1000), S.num(f"fy.{i}", 4, lo=-100, hi=1000), S.num(f"fy.{i}", 5, lo=-100, hi=1000)
+        if lab and (r is not None or d_ is not None or b is not None):
+            F.fy.append(dict(label=lab, reg=r, dir=d_, bm=b))
+    # allocation
+    F.alloc_title = S.txt("alloc.title")
+    F.alloc = []
+    for i in range(1, 7):
+        lab, v = S.txt(f"alloc.{i}", 2), S.num(f"alloc.{i}", 3, lo=0, hi=100)
+        if lab and v is not None:
+            F.alloc.append((lab, v))
+    if F.alloc and not (98.5 <= sum(v for _, v in F.alloc) <= 101.5):
+        warn(f"Allocation bars add up to {sum(v for _, v in F.alloc):.2f}% (expected about 100%)")
+    # holdings
+    F.top = []
+    for i in range(1, 11):
+        nm, v = S.txt(f"top.{i}", 2), S.num(f"top.{i}", 3, lo=0, hi=100)
+        if nm and v is not None:
+            F.top.append((nm, v))
+        elif nm or v is not None:
+            err(f"Top holding {i}: name and % must both be filled")
+    if not F.top:
+        warn("No top-10 holdings filled")
+    if sum(v for _, v in F.top) > 100.01:
+        err("Top-10 holdings add up to more than 100%")
+    F.added, F.reduced = [], []
+    for pre, lst in (("add", F.added), ("red", F.reduced)):
+        for i in range(1, 11):
+            nm, v = S.txt(f"{pre}.{i}", 2), S.num(f"{pre}.{i}", 3, lo=0, hi=100)
+            if nm and v is not None:
+                lst.append((nm, v))
+            elif nm or v is not None:
+                err(f"Changes in holdings {pre}.{i}: name and % must both be filled")
+    # links & common text
+    F.links = [(lab, S.url(key)) for key, lab in [
+        ("link.securities", "Detailed Investment in Securities"), ("link.sectors", "Allocation of Net Asset by Sectors"),
+        ("link.asset_class", "Allocation of Net Asset by Asset Class"),
+        ("link.credit", "Allocation of Net Assets by Credit Rating"),
+        ("link.region", "Allocation of Net Assets by region/country")]]
+    F.web = [(WEB_NAMES[i - 1], S.txt(f"web.{i}.desc"), S.url(f"web.{i}.url")) for i in range(1, 7)]
+    g = lambda k: S.txt(k)
+    F.t = {k: g(k) for k in [
+        "common.label_intro", "common.label_footer", "common.past_perf", "common.rf.1", "common.rf.2", "common.rf.3",
+        "common.rf.4", "common.rf.note", "common.rm.std", "common.rm.info", "common.rm.sharpe", "common.rm.beta",
+        "common.fn.detail_page", "common.fn.na"]}
+    for k, v in F.t.items():
+        if not v and k not in ("common.rf.note", "common.fn.na", "common.fn.detail_page"):
+            warn(f"{S.addr(k)} ({k}) is empty")
+    F.foot = [S.txt(k) for k in FOOT_ORDER if S.txt(k)]
+    F.extra_name_note = S.txt("fund.name_note")
+    if F.asof:
+        for t in F.foot:
+            for m in re.finditer(r"\b(\d{2})/(\d{2})/(\d{4})\b", t):
+                try:
+                    if dt.date(int(m[3]), int(m[2]), int(m[1])) != F.asof:
+                        warn(f"Footnote mentions {m[0]} but the as-of date is {F.asof:%d/%m/%Y}")
+                except ValueError:
+                    pass
+
+    if S.placeholders:
+        warn(f"{len(S.placeholders)} link URL(s) are still placeholders (example.com or '...'): "
+             + ", ".join(S.placeholders))
+    # images
+    bases = [S.name, F.name]
+    F.img_scheme = find_image(risk_idx, bases, ["scheme riskometer", "riskometer", "scheme", ""])
+    F.img_bm = find_image(risk_idx, bases, ["benchmark riskometer", "benchmark", "bm riskometer", "bm"])
+    F.img_qr = find_image(qr_idx, bases, ["qr", "qr code", "qrcode", ""])
+    for img, what, folder in [(F.img_scheme, f"{S.name}_scheme_riskometer", RISK_DIR),
+                              (F.img_bm, f"{S.name}_benchmark_riskometer", RISK_DIR),
+                              (F.img_qr, f"{S.name}_qr", QR_DIR)]:
+        if img is None:
+            err(f"image not found: '{what}' (.png/.jpg/.jpeg) in {folder}")
+    return F
+
+
+# =============================================================================
+# Page geometry
+# =============================================================================
+W, H = A4
+MX = 18.0
+CW = W - 2 * MX
+BOTTOM = 46.0            # content must end above this
+LOGO_W, LOGO_H = 112.0, 38.0
+
+LOGO_FILE: Path | None = None
+
+
+def draw_header(P, F, title=False):
+    x, top = W - MX - LOGO_W, H - 14
+    if LOGO_FILE:
+        im, asp = prepare_image(LOGO_FILE, LOGO_W, LOGO_H, "art")
+        dw, dh = (LOGO_H * asp, LOGO_H) if LOGO_H * asp <= LOGO_W else (LOGO_W, LOGO_W / asp)
+        P.image(im, x + LOGO_W - dw, top - dh, dw, dh)
+    elif F.amc:
+        P.txt(W - MX, top - 20, F.amc, FONT_BOLD, 10, "r")
+    if title:
+        avail = W - 2 * MX - 2 * (LOGO_W + 8)
+        size = 19.0
+        while size > 13 and rw(F.name, FONT_BOLD, size) > avail:
+            size -= 0.5
+        cx = MX + (W - 2 * MX) / 2
+        if rw(F.name, FONT_BOLD, size) <= avail:
+            P.txt(cx, H - 36, F.name, FONT_BOLD, size, "c")
+            if F.former:
+                P.txt(cx, H - 49, F.former, FONT_REG, 9, "c")
+        else:                                    # very long name: two lines
+            size = 12.5
+            lines = wrap(F.name, FONT_BOLD, size, avail)
+            if len(lines) > 2:
+                warn("Fund name is too long for the title; it will be cut to two lines")
+            for i, ln in enumerate(lines[:2]):
+                P.txt(cx, H - 29 - i * 13.5, ln, FONT_BOLD, size, "c")
+            if F.former:
+                P.txt(cx, H - 54, F.former, FONT_REG, 8, "c")
+    P.line(MX, H - 58, W - MX, H - 58, 0.9)
+
+
+def draw_footer(P, F, page_no):
+    P.line(MX, 40, W - MX, 40, 0.5)
+    P.txt(W / 2, 24, F.t["common.past_perf"], FONT_BOLD, 10.5, "c")
+    P.txt(W - MX, 24, str(page_no), FONT_REG, 8.5, "r")
+
+
+# =============================================================================
+# Charts
+# =============================================================================
+def nice_ticks(vmin, vmax, target=5):
+    vmin, vmax = min(vmin, 0.0), max(vmax, 0.0)
+    if vmax == vmin:
+        vmax = vmin + 1
+    raw = (vmax - vmin) / target
+    mag = 10 ** math.floor(math.log10(raw))
+    step = next(m * mag for m in (1, 2, 2.5, 5, 10) if m * mag >= raw)
+    lo, hi = math.floor(vmin / step + 1e-9) * step, math.ceil(vmax / step - 1e-9) * step
+    n = int(round((hi - lo) / step))
+    return lo, hi, step, [lo + i * step for i in range(n + 1)]
+
+
+def fy_chart(P, x, top, w, h, rows):
+    series = [("Regular", "reg", GOLD), ("Direct", "dir", NAVY), ("Benchmark", "bm", CREAM)]
+    series = [s_ for s_ in series if any(r[s_[1]] is not None for r in rows)]
+    vals = [r[k] for r in rows for _, k, _ in series if r[k] is not None]
+    if not vals:
+        return
+    span = max(max(vals), 0) - min(min(vals), 0) or 1
+    lo, hi, step, ticks = nice_ticks(min(vals) - (0.13 * span if min(vals) < 0 else 0), max(vals) + 0.15 * span)
+    px0, px1 = x + 27, x + w - 6
+    pt, pb = top - 7, top - h + 30
+    yv = lambda v: pb + (v - lo) / (hi - lo) * (pt - pb)
+    dec = 0 if step >= 1 and float(step).is_integer() else 1
+    for t in ticks:
+        P.line(px0, yv(t), px1, yv(t), 0.25, [1.5, 1.5])
+        P.txt(px0 - 3, yv(t) - 2.0, f"{t:.{dec}f}", FONT_REG, 6, "r")
+    gw = (px1 - px0) / len(rows)
+    k = len(series)
+    bw = min(11.0, gw * 0.84 / k)
+    for gi, r in enumerate(rows):
+        gx = px0 + gi * gw + (gw - bw * k) / 2
+        for si, (nm, key, col) in enumerate(series):
+            v = r[key]
+            if v is None:
+                continue
+            bx = gx + si * bw
+            y0, y1 = yv(0), yv(v)
+            P.rect(bx, max(y0, y1), bw, abs(y1 - y0), fill=col, stroke=NAVY, lw=0.5 if col != CREAM else 0.8)
+            if not P.dry:
+                c = P.c
+                c.saveState()
+                c.setFillColor(BLACK)
+                c.setFont(FONT_REG, 5.6)
+                c.translate(bx + bw / 2 + 2.0, (y1 + 2) if v >= 0 else (y1 - 2))
+                c.rotate(90)
+                (c.drawString if v >= 0 else c.drawRightString)(0, 0, f_fixed(v, 2))
+                c.restoreState()
+        P.txt(px0 + gi * gw + gw / 2, pb - 9, r["label"], FONT_REG, 6.2, "c")
+    P.line(px0, yv(0), px1, yv(0), 0.8)
+    P.line(px0, pb, px0, pt, 0.8)
+    # legend
+    lw_ = sum(10 + pdfmetrics.stringWidth(n_, FONT_REG, 6.5) + 10 for n_, _, _ in series) - 10
+    lx, ly = x + (w - lw_) / 2, top - h + 9
+    for nm, key, col in series:
+        P.rect(lx, ly + 3, 6, 6, fill=col, stroke=NAVY, lw=0.6)
+        P.txt(lx + 9, ly, nm, FONT_REG, 6.5)
+        lx += 10 + pdfmetrics.stringWidth(nm, FONT_REG, 6.5) + 10
+
+
+def alloc_chart(P, x, top, w, h, rows):
+    vmax = max(v for _, v in rows)
+    _, hi, step, ticks = nice_ticks(0, vmax, 4)
+    lab_w = max(rw(l, FONT_REG, 7.5) for l, _ in rows) + 8
+    px0, px1 = x + lab_w, x + w - 38
+    pt, pb = top - 6, top - h + 16
+    slot = (pt - pb) / len(rows)
+    bh = min(14.0, slot * 0.62)
+    for t in ticks:
+        xx = px0 + t / hi * (px1 - px0)
+        P.line(xx, pb, xx, pb - 2.5, 0.6)
+        P.txt(xx, pb - 10, f"{t:g}%", FONT_REG, 6.5, "c")
+    for i, (lab, v) in enumerate(rows):
+        cy = pt - slot * (i + 0.5)
+        bwid = v / hi * (px1 - px0)
+        P.rect(px0, cy + bh / 2, bwid, bh, fill=GOLD, stroke=NAVY, lw=0.5)
+        P.txt(px0 - 4, cy - 2.6, lab, FONT_REG, 7.5, "r")
+        P.txt(px0 + bwid + 3, cy - 2.6, pct(v), FONT_REG, 7.5)
+    P.line(px0, pb, px0, pt, 0.8)
+    P.line(px0, pb, px1, pb, 0.8)
+
+
+# =============================================================================
+# Page 1
+# =============================================================================
+def left_col(P, F, x, top, w, s):
+    PX = 5.0
+    iw = w - 2 * PX
+    y = [top]
+
+    def add(h):
+        y[0] -= h
+
+    def row(label, value, lf=0.55, bl=True, bv=False):
+        add(kv_row(P, x + PX, y[0], iw, label, value, s, lf, bl, bv))
+
+    def head(t):
+        add(bar(P, x, y[0], w, t, s))
+
+    asof = d_us(F.asof)
+    head("Fund Details")
+    row("Date of Inception / Allotment", d_long(F.inception), 0.56)
+    row("Benchmark:", F.benchmark, 0.30)
+    if F.addl:
+        row("Additional Benchmark:", F.addl, 0.46)
+    add(text_row(P, x + PX, y[0], iw, f"NAV as on {asof}", s, bold=True))
+    for lab, v in F.nav:
+        row(lab, f"{RUPEE} {f_fixed(v, 4)}", 0.60, bl=False)
+    row(f"AUM as on {asof}", f"{RUPEE} {indian(F.aum, 2)} Crores", 0.46)
+    row(f"AAUM as on {asof}", f"{RUPEE} {indian(F.aaum, 2)} Crores", 0.46)
+
+    head("Fund Manager Details")
+    add(text_row(P, x + PX, y[0], iw, "Name of Fund Managers", s, bold=True))
+    for nm, _, _ in F.fms:
+        add(text_row(P, x + PX, y[0], iw, "\u2022  " + nm, s, bold=True, pady=1.4))
+    row("Total Experience (Years)", " / ".join(num_text(e) for _, e, _ in F.fms), 0.60)
+    row("Managing Since", " / ".join(d_long(d) if d else "NA" for _, _, d in F.fms), 0.34)
+
+    head("Minimum Investment")
+    row("Lumpsum Amount", F.lumpsum, 0.36, bl=False)
+    row("SIP Amount", F.sip, 0.36, bl=False)
+
+    head("Load Structure")
+    prev = ""
+    for ln in F.load:
+        sub = False
+        t = ln
+        if t.startswith(">"):
+            sub, t = True, t[1:].strip()
+        elif t.startswith("\u2022"):
+            t = t[1:].strip()
+        elif prev.rstrip().endswith((":", ",")):
+            sub = True
+        if sub:
+            add(text_row(P, x + PX, y[0], iw, t, s, indent=11, pady=1.0))
+        else:
+            hh = P.para(x + PX + 9, y[0] - 1.6, iw - 9, t, FONT_REG, s, lead=s * 1.28)
+            P.txt(x + PX + 1.5, y[0] - 1.6 - s * 1.28 / 2 - s * 0.35, "\u2022", FONT_REG, s)
+            add(hh + 3.2)
+        prev = ln
+    add(2.0)
+
+    head("Expense Ratio")
+    for k in ("Regular", "Direct"):
+        v = F.ter[k][0]
+        row(f"{k} Plan: BER", pct(v), 0.62)
+
+    head("Risk Measures")
+    for i, (lab, v) in enumerate([("Standard Deviation (%)", F.std), ("Beta", F.beta),
+                                  ("Sharpe Ratio", F.sharpe), ("Information Ratio", F.info)], 1):
+        P.txt(x + PX, y[0] - 2 - s * 1.28 / 2 - s * 0.35, str(i), FONT_REG, s)
+        add(kv_row(P, x + PX + 9, y[0], iw - 9, lab, plain(v), s, 0.78, False))
+    add(text_row(P, x + PX, y[0], iw, F.t["common.fn.detail_page"], s - 0.3, bold=True))
+    add(text_row(P, x + PX, y[0], iw, F.t["common.fn.na"] or "NA stands for \u201cNot Applicable\u201d", s - 0.3, bold=True))
+    h = top - y[0]
+    P.rect(x, top, w, h, fill=None, stroke=NAVY, lw=0.8)
+    return h
+
+
+def mid_col(P, F, x, top, w, s, ch):
+    y = top
+    rows = [[r["label"], pct(r["reg"]), pct(r["dir"]), pct(r["bm"])] for r in F.perf]
+    cw0 = 62.0
+    rest = (w - cw0) / 3
+    y -= table(P, x, y, [cw0, rest, rest, rest],
+               [["Compounded Annualised Returns", "Scheme Returns (%) - Regular", "Scheme Returns (%) - Direct",
+                 "Benchmark Returns (%)"]], rows, s, ["l", "c", "c", "c"], title="Fund Performance")
+    note = f"Performance as on {d_us(F.asof)}. Returns for periods up to 1 year are absolute; beyond 1 year they are compounded annualised (CAGR)."
+    y -= P.para(x, y - 2, w, note, FONT_REG, s - 0.5, lead=(s - 0.5) * 1.25) + 8
+
+    if F.fy:
+        t0 = y
+        hb = bar(P, x, y, w, "Absolute Returns", s)
+        fy_chart(P, x, y - hb, w, ch, F.fy)
+        cap = f"Absolute Returns for each F.Y. for last {len(F.fy)} year{'s' if len(F.fy) > 1 else ''}."
+        capy = y - hb - ch
+        hcap = P.para(x + 4, capy, w - 8, cap, FONT_REG, s - 0.5, lead=(s - 0.5) * 1.25) + 3
+        y = capy - hcap
+        P.rect(x, t0, w, t0 - y, fill=None, stroke=NAVY, lw=0.8)
+        y -= 8
+
+    rows = [[str(i), nm, pct(v)] for i, (nm, v) in enumerate(F.top, 1)]
+    y -= table(P, x, y, [17, w - 17 - 52, 52],
+               [[Cell(""), "Top 10 Holdings", "% of Net Assets"]], rows, s, ["c", "l", "c"], title="Portfolio Data")
+    return top - y
+
+
+def risk_panel(P, F, x, top, w, s, ih, which):
+    scheme = which == "scheme"
+    title = "Scheme Riskometer" if scheme else "Benchmark Riskometer"
+    img = F.img_scheme if scheme else F.img_bm
+    level = (F.rm_scheme if scheme else F.rm_bm).lower()
+    y = top
+    y -= bar(P, x, y, w, title, s)
+    y -= 3
+    if RISKOMETER_CAPTIONS:
+        y -= P.para(x + 3, y, w - 6, F.name if scheme else F.benchmark, FONT_REG, s - 0.4, align="c") + 1
+    bw = w - 8
+    if img is not None and not P.dry:
+        im, asp = prepare_image(img, bw, ih, "art")
+        dw, dh = (ih * asp, ih) if ih * asp <= bw else (bw, bw / asp)
+        P.image(im, x + (w - dw) / 2, y - ih + (ih - dh) / 2, dw, dh)
+    y -= ih
+    if RISKOMETER_CAPTIONS:
+        y -= P.para(x + 3, y - 1, w - 6, f"This risk of the {'scheme' if scheme else 'benchmark'} is {level}.",
+                    FONT_BOLD, s - 0.6, align="c") + 1
+    y -= 3
+    P.rect(x, top, w, top - y, fill=None, stroke=NAVY, lw=0.8)
+    return top - y
+
+
+def right_col(P, F, x, top, w, s, ih):
+    y = top
+    y -= risk_panel(P, F, x, y, w, s, ih, "scheme") + 6
+    y -= risk_panel(P, F, x, y, w, s, ih, "benchmark") + 6
+    rf = [[str(i), F.t[f"common.rf.{i}"]] for i in range(1, 5) if F.t.get(f"common.rf.{i}")]
+    y -= table(P, x, y, [15, w - 15], [], rf, s - 0.2, ["c", "l"], title="Major Risk Factors")
+    if F.t["common.rf.note"]:
+        y -= P.para(x + 1, y - 2, w - 2, F.t["common.rf.note"], FONT_REG, s - 0.5, lead=(s - 0.5) * 1.25) + 7
+    else:
+        y -= 6
+    q = [["1", Cell("Portfolio Turnover Ratio (Annualized)^", span=2)],
+         ["", "a) Equity Turnover", plain(F.turn_eq)],
+         ["", "b) Gross Exposure Turnover", plain(F.turn_gross)],
+         ["", Cell("(Equity + Debt + Derivatives)", span=2)]]
+    y -= table(P, x, y, [15, w - 15 - 28, 28], [], q, s - 0.2, ["c", "l", "c"],
+               title="Quantitative Measures/Risk Measures* (as applicable)")
+    y -= P.para(x + 1, y - 2, w - 2, F.t["common.fn.detail_page"], FONT_BOLD, s - 0.5, lead=(s - 0.5) * 1.25) + 3
+    y -= P.para(x + 1, y - 1, w - 2, F.t["common.fn.na"] or "NA stands for \u201cNot Applicable\u201d",
+                FONT_BOLD, s - 0.5, lead=(s - 0.5) * 1.25) + 2
+    return top - y
+
+
+def addl_panel(P, F, x, top, w, s):
+    y = top
+    y -= bar(P, x, y, w, "Additional Information pertaining to Portfolio of the scheme", s)
+    rh = s * 2.5
+    bw = 66.0
+    for lab, url in F.links:
+        P.txt(x + 5, y - rh / 2 - s * 0.35, lab, FONT_BOLD, s + 0.3)
+        if url:
+            bx = x + w - bw - 14
+            P.rect(bx, y - 2.5, bw, rh - 5, fill=GOLD, stroke=NAVY, lw=0.8, radius=4)
+            P.txt(bx + bw / 2, y - rh / 2 - s * 0.35, "Click here", FONT_BOLD, s, "c")
+            P.link(url, bx, y - 2.5, bw, rh - 5)
+        P.line(x, y - rh, x + w, y - rh, 0.3)
+        y -= rh
+    P.rect(x, top, w, top - y, fill=None, stroke=NAVY, lw=0.8)
+    return top - y
+
+
+def page1(P, F, page_no):
+    P.fill_page()
+    draw_header(P, F, title=True)
+    y = H - 66
+    lab_w = max(rw("Type of Scheme:", FONT_BOLD, 9.5), rw("Product labelling:", FONT_BOLD, 9.5)) + 8
+    P.txt(MX, y - 8.5, "Type of Scheme:", FONT_BOLD, 9.5)
+    y -= P.para(MX + lab_w, y, CW - lab_w, F.type, FONT_REG, 9.5, lead=12.4) + 5
+    P.txt(MX, y - 8.5, "Product labelling:", FONT_BOLD, 9.5)
+    tw_ = CW - lab_w - 118
+    y -= P.para(MX + lab_w, y, tw_, F.t["common.label_intro"], FONT_REG, 9.5, lead=12.4)
+    for b in F.labels:
+        hb = P.para(MX + lab_w + 18, y, tw_ - 18, b, FONT_REG, 9.5, lead=12.4)
+        P.txt(MX + lab_w + 6, y - 12.4 / 2 - 9.5 * 0.35, "\u2022", FONT_REG, 9.5)
+        y -= hb
+    y -= P.para(MX + lab_w, y, tw_, F.t["common.label_footer"], FONT_REG, 9.5, lead=12.4)
+    P.txt(W - MX, y + 4, F.month, FONT_BOLD, 13.5, "r")
+    col_top = y - 8
+
+    LW_, MW_ = 172.0, 215.0
+    RW_ = CW - LW_ - MW_ - 16
+    xL, xM, xR = MX, MX + LW_ + 8, MX + LW_ + MW_ + 16
+    chosen = None
+    for k in range(0, 41):
+        s, ch, ih = 8.0 - 0.1 * k, max(96.0, 150.0 - 3 * k), max(58.0, 92.0 - 2 * k)
+        P.dry = True
+        hL = left_col(P, F, xL, 0, LW_, s)
+        hM = mid_col(P, F, xM, 0, MW_, s, ch)
+        hR = right_col(P, F, xR, 0, RW_, s, ih)
+        hA = addl_panel(P, F, xM, 0, MW_ + 8 + RW_, s)
+        P.dry = False
+        okL = hL <= col_top - BOTTOM
+        okMR = max(hM, hR) <= col_top - BOTTOM - hA - 8
+        chosen = (s, ch, ih, hA)
+        if okL and okMR:
+            break
+    else:
+        warn(f"Page 1 content does not fit even at the smallest font size ({s:.1f}pt): shorten text")
+    s, ch, ih, hA = chosen
+    P.dry = True
+    spare_m = (col_top - BOTTOM - hA - 8) - mid_col(P, F, xM, 0, MW_, s, ch)
+    spare_r = (col_top - BOTTOM - hA - 8) - right_col(P, F, xR, 0, RW_, s, ih)
+    P.dry = False
+    ch += max(0.0, min(spare_m - 4, 60.0))
+    ih += max(0.0, min((spare_r - 4) / 2, 100.0 - ih))
+    left_col(P, F, xL, col_top, LW_, s)
+    mid_col(P, F, xM, col_top, MW_, s, ch)
+    right_col(P, F, xR, col_top, RW_, s, ih)
+    addl_panel(P, F, xM, BOTTOM + hA, MW_ + 8 + RW_, s)
+    draw_footer(P, F, page_no)
+
+
+# =============================================================================
+# Page 2
+# =============================================================================
+def _p2_layout(P, F, s):
+    """Draws (or, when P.dry, measures) page 2. Returns (bottom of description table, top of weblinks)."""
+    y = H - 66
+    y -= P.para(MX, y, CW, "Major Changes w.r.t previous month \u2013", FONT_BOLD, 10.5) + 8
+    LWd = 346.0
+    rows = [[nm, "", pct(v)] for nm, v in F.added] + [["", nm, pct(v)] for nm, v in F.reduced]
+    if not rows:
+        rows = [[Cell("No major changes in holdings this month", span=3)]]
+    hL = table(P, MX, y, [128, 128, 90],
+               [["Name of Securities Added/ Increased", "Name of securities deleted/reduced", "Total Weightage in %"]],
+               rows, s, ["l", "l", "c"], title="(Top 10 changes in Holding) in portfolio of the scheme")
+    xr = MX + LWd + 12
+    wr = W - MX - xr
+    cws = [wr - 120, 60, 60]
+    er = [[k, pct(F.ter[k][1]) if F.ter[k][1] is not None else "NA", pct(F.ter[k][0])] for k in ("Direct", "Regular")]
+    hR1 = table(P, xr, y, cws, [["Change in", "Previous Month", "Current Month"]], er, s,
+                ["l", "c", "c"], title="Changes in Base Expense Ratio of the scheme")
+    hR2 = table(P, xr, y - hR1 - 10, cws, [["Change in", "Previous Month", "Current Month"]],
+                [["Scheme Riskometer", F.rm_prev or "NA", F.rm_scheme]], s, ["l", "c", "c"],
+                title="Changes in Risk-o-Meter of scheme")
+    y -= max(hL, hR1 + 10 + hR2) + 14
+
+    desc = [("Standard Deviation (%)", "common.rm.std"), ("Beta", "common.rm.beta"),
+            ("Sharpe Ratio", "common.rm.sharpe"), ("Information Ratio", "common.rm.info")]
+    d_rows = [[str(i), n, F.t[k]] for i, (n, k) in enumerate(desc, 1)]
+    hD = table(P, MX, y, [40, 170, CW - 210], [["Sr. No.", "Quantitative Measures/Risk Measures",
+                                                "Brief description/ Inference of the Quantitative measure"]],
+               d_rows, s, ["c", "l", "l"], title="Description/Inference of the Quantitative/Risk Measures")
+
+    wrows = []
+    for i, (nm, d_, url) in enumerate(F.web, 1):
+        if i == 4:
+            im = prepare_image(F.img_qr, 60, 60, "qr") if F.img_qr else None
+            wrows.append([str(i), Cell("", img=im, img_h=54.0, link=url), d_])
+        else:
+            wrows.append([str(i), Cell(nm, link=url, underline=bool(url)), d_])
+    args = ([40, 170, CW - 210], [["Sr. No.", "Links", "Description"]], wrows, s + 0.3, ["c", "l", "l"])
+    was = P.dry
+    P.dry = True
+    hW = table(P, MX, 0, *args, title="Important Weblinks", pady=3.4)
+    P.dry = was
+    wtop = BOTTOM + 6 + hW
+    table(P, MX, wtop, *args, title="Important Weblinks", pady=3.4)
+    return y - hD, wtop
+
+
+def page2(P, F, page_no):
+    P.fill_page()
+    draw_header(P, F)
+    for k in range(0, 21):
+        s = 7.8 - 0.1 * k
+        P.dry = True
+        bottom, wtop = _p2_layout(P, F, s)
+        P.dry = False
+        if bottom >= wtop + 8:
+            break
+    else:
+        warn("Page 2: the changes-in-holdings list is too long to fit; shorten the names")
+    _p2_layout(P, F, s)
+    draw_footer(P, F, page_no)
+
+
+# =============================================================================
+# Page 3
+# =============================================================================
+def page3(P, F, page_no):
+    P.fill_page()
+    draw_header(P, F)
+    s = 8.4
+    y = H - 66
+    y -= P.para(MX, y, CW, "Additional Disclosure", FONT_BOLD, 11.5) + 8
+
+    def item(label, text):
+        nonlocal y
+        if not text:
+            return
+        lw_ = rw(label + " ", FONT_BOLD, s + 0.6)
+        P.txt(MX, y - (s + 0.6) * 1.3 / 2 - (s + 0.6) * 0.35, label, FONT_BOLD, s + 0.6)
+        y -= P.para(MX, y, CW, text, FONT_REG, s + 0.6, lead=(s + 0.6) * 1.3, first_indent=lw_) + 5
+
+    item("About the Fund:", F.about)
+    item("Category:", F.category)
+    item("SIP Frequency:", F.sip_freq)
+    item("SIP Dates (Monthly/Quarterly)@@:", F.sip_dates)
+    item("Minimum Investment Amount:", F.lumpsum)
+    item("Option Available:", F.options)
+    y -= 4
+
+    if F.alloc:
+        cw_, chh = 300.0, 22.0 + 26.0 * len(F.alloc)
+        hb = bar(P, MX, y, cw_, F.alloc_title or "ALLOCATION", s)
+        alloc_chart(P, MX, y - hb, cw_, chh, F.alloc)
+        P.rect(MX, y, cw_, hb + chh, fill=None, stroke=NAVY, lw=0.8)
+        y -= hb + chh + 14
+
+    # performance table (custom: two-level header)
+    n = len(F.perf)
+    name_w = 132.0
+    colw = (CW - name_w) / (2 * n)
+    widest = 0
+    fs = 7.6
+    rows = [(F.name, "reg", "v_reg")]
+    rows.append((F.benchmark + "#", "bm", "v_bm"))
+    if F.addl:
+        rows.append((F.addl + "##", "ab", "v_ab"))
+    while fs > 6.0:
+        cells = [pct(r_[k]) for r_ in F.perf for _, k, _ in rows] + [indian(r_[v], 0) if r_[v] is not None else "NA"
+                                                                       for r_ in F.perf for _, _, v in rows]
+        if max(rw(t, FONT_REG, fs) for t in cells) <= colw - 3:
+            break
+        fs -= 0.2
+    lead = fs * 1.22
+    labels = []
+    for r_ in F.perf:
+        lab = r_["label"]
+        if r_["key"] == "perf.SI" and F.inception:
+            lab = f"Since Inception {d_short(F.inception)}"
+        labels.append(lab)
+    hs = fs
+    words = [w_ for l in labels for w_ in l.split()]
+    while hs > 5.5 and max(rw(w_, FONT_BOLD, hs) for w_ in words) > colw - 5:
+        hs -= 0.2
+    h_title = bar(P, MX, y, CW, "Performance Table", fs)
+    t0 = y
+    y -= h_title
+    h1 = lead + 7
+    h2 = max(len(wrap(l, FONT_BOLD, hs, colw - 4)) for l in labels) * hs * 1.22 + 7
+    P.rect(MX, y, CW, h1 + h2, fill=None, stroke=NAVY, lw=0.8)
+    P.txt(MX + name_w / 2, y - (h1 + h2) / 2 - fs * 0.35, "Scheme Name", FONT_BOLD, fs, "c")
+    P.line(MX + name_w, y, MX + name_w, y - h1 - h2, 0.6)
+    P.txt(MX + name_w + n * colw / 2, y - h1 / 2 - fs * 0.35, "CAGR Returns (%)", FONT_BOLD, fs, "c")
+    P.txt(MX + name_w + 1.5 * n * colw, y - h1 / 2 - fs * 0.35,
+          f"Current Value of Investment of {RUPEE}10,000", FONT_BOLD, fs, "c")
+    P.line(MX + name_w, y - h1, W - MX, y - h1, 0.6)
+    P.line(MX + name_w + n * colw, y, MX + name_w + n * colw, y - h1 - h2, 0.9)
+    for blk in (0, 1):
+        for i, lab in enumerate(labels):
+            cx = MX + name_w + (blk * n + i) * colw
+            if i or blk:
+                P.line(cx, y - h1, cx, y - h1 - h2, 0.4)
+            lines = wrap(lab, FONT_BOLD, hs, colw - 4)
+            hl = hs * 1.22
+            for j, ln in enumerate(lines):
+                P.txt(cx + colw / 2, y - h1 - (h2 - len(lines) * hl) / 2 - j * hl - hl / 2 - hs * 0.35,
+                      ln, FONT_BOLD, hs, "c")
+    y -= h1 + h2
+    P.line(MX, y, W - MX, y, 0.9)
+    for nm, k, v in rows:
+        nl = wrap(nm, FONT_BOLD, fs, name_w - 6)
+        rh = max(len(nl) * lead + 6, lead + 6)
+        for j, ln in enumerate(nl):
+            P.txt(MX + 3, y - (rh - len(nl) * lead) / 2 - j * lead - lead / 2 - fs * 0.35, ln, FONT_BOLD, fs)
+        for i, r_ in enumerate(F.perf):
+            cx = MX + name_w + i * colw
+            P.txt(cx + colw / 2, y - rh / 2 - fs * 0.35, pct(r_[k]), FONT_REG, fs, "c")
+            cx2 = MX + name_w + (n + i) * colw
+            P.txt(cx2 + colw / 2, y - rh / 2 - fs * 0.35, indian(r_[v], 0) if r_[v] is not None else "NA",
+                  FONT_REG, fs, "c")
+        for i in range(1, 2 * n):
+            cx = MX + name_w + i * colw
+            P.line(cx, y, cx, y - rh, 0.4 if i != n else 0.9)
+        P.line(MX + name_w, y, MX + name_w, y - rh, 0.6)
+        y -= rh
+        P.line(MX, y, W - MX, y, 0.4)
+    P.rect(MX, t0, CW, t0 - y, fill=None, stroke=NAVY, lw=0.8)
+    y -= 9
+
+    fsz = 7.6
+    for t in F.foot:
+        y -= P.para(MX, y, CW, t, FONT_REG, fsz, lead=fsz * 1.28) + 3
+    if y < BOTTOM:
+        warn("Page 3 footnotes run into the footer")
+    draw_footer(P, F, page_no)
+
+
+# =============================================================================
+# Driver
+# =============================================================================
+def find_logo(cli_logo):
+    cands = []
+    if cli_logo:
+        cands.append(Path(cli_logo))
+    if LOGO_PATH:
+        cands.append(Path(LOGO_PATH))
+    for ext in (".png", ".jpg", ".jpeg"):
+        cands += [BASE_DIR / f"logo{ext}", BASE_DIR / "Logo" / f"logo{ext}", BASE_DIR / "logo" / f"logo{ext}",
+                  RISK_DIR / f"logo{ext}", QR_DIR / f"logo{ext}"]
+    for p in cands:
+        if p.is_file():
+            return p
+    return None
+
+
+def load_funds():
+    if not EXCEL_PATH.is_file():
+        sys.exit(f"Workbook not found: {EXCEL_PATH}")
+    wb = openpyxl.load_workbook(EXCEL_PATH, data_only=True)
+    qr_idx, risk_idx = index_dir(QR_DIR), index_dir(RISK_DIR)
+    if not QR_DIR.is_dir():
+        err(f"QR folder not found: {QR_DIR}")
+    if not RISK_DIR.is_dir():
+        err(f"Riskometer folder not found: {RISK_DIR}")
+    funds = []
+    for ws in wb.worksheets:
+        if ws.title.startswith("_") or ws.sheet_state != "visible":
+            continue
+        _CTX[0] = ws.title
+        try:
+            funds.append(parse_fund(ws, qr_idx, risk_idx))
+        except Exception as e:  # never let one bad sheet hide the others' problems
+            err(f"could not read sheet: {type(e).__name__}: {e}")
+    _CTX[0] = "-"
+    if not funds:
+        err("No fund sheets found (sheets starting with '_' are ignored)")
+    # duplicate-content detector
+    seen = {}
+    for F in funds:
+        sig = (tuple(F.nav[:1]), F.about, tuple(F.top))
+        if sig in seen:
+            ISSUES.append(("WARN", F.sheet, f"content is identical to sheet '{seen[sig]}' (unedited copy?)"))
+        seen.setdefault(sig, F.sheet)
+    return funds
+
+
+def build_pdf(funds, out: Path, start_page: int):
+    tmp = out.with_suffix(".tmp.pdf")
+    c = canvas.Canvas(str(tmp), pagesize=A4, pageCompression=1)
+    f0 = funds[0]
+    c.setTitle(f"{f0.amc or 'Fund'} - Factsheets - {f0.month}")
+    c.setAuthor(f0.amc or "")
+    c.setSubject(f"Mutual fund factsheets, {f0.month}")
+    c.setCreator("generate_factsheets.py")
+    P = Painter(c)
+    n = start_page
+    for i, F in enumerate(funds):
+        _CTX[0] = F.sheet
+        key = f"fund{i}"
+        c.bookmarkPage(key)
+        c.addOutlineEntry(re.sub(r"[$\u00a3#@^]+$", "", F.name), key, 0)
+        for fn in (page1, page2, page3):
+            fn(P, F, n)
+            c.showPage()
+            n += 1
+        print(f"  \u2713 {F.name}  (pages {n - 3}-{n - 1})")
+    c.save()
+    os.replace(tmp, out)
+    _CTX[0] = "-"
+
+
+def main():
+    global EXCEL_PATH, QR_DIR, RISK_DIR, LOGO_FILE, OUTPUT_PDF
+    ap = argparse.ArgumentParser(description="Build the combined factsheet PDF from the Excel data workbook.")
+    ap.add_argument("--excel", type=Path, default=EXCEL_PATH)
+    ap.add_argument("--qr-dir", type=Path, default=QR_DIR)
+    ap.add_argument("--risk-dir", type=Path, default=RISK_DIR)
+    ap.add_argument("--logo", type=Path, default=None)
+    ap.add_argument("--out", type=Path, default=OUTPUT_PDF)
+    ap.add_argument("--start-page", type=int, default=START_PAGE)
+    ap.add_argument("--check", action="store_true", help="validate the data and images only; write no PDF")
+    ap.add_argument("--strict", action="store_true", help="treat warnings as errors")
+    a = ap.parse_args()
+    EXCEL_PATH, QR_DIR, RISK_DIR, OUTPUT_PDF = a.excel, a.qr_dir, a.risk_dir, a.out
+
+    register_fonts()
+    LOGO_FILE = find_logo(a.logo)
+    print(f"Logo : {LOGO_FILE or 'not found - AMC name will be printed instead'}")
+    if LOGO_FILE is None:
+        warn("logo not found (looked for logo.png/jpg in the Factsheet folder); AMC name printed instead")
+    funds = load_funds()
+    if _MISSING:
+        warn("characters missing from the font (will print as boxes): " + " ".join(sorted(_MISSING)))
+
+    errors = [i for i in ISSUES if i[0] == "ERROR"]
+    if not errors and not a.check:
+        print(f"Building {len(funds)} fund(s) ...")
+        build_pdf(funds, a.out, a.start_page)
+        if _MISSING:
+            ISSUES.append(("WARN", "-", "characters missing from the font: " + " ".join(sorted(_MISSING))))
+    seen = set()
+    for lvl, ctx, msg in ISSUES:
+        if (lvl, ctx, msg) in seen:
+            continue
+        seen.add((lvl, ctx, msg))
+        print(f"[{lvl}] {ctx}: {msg}")
+    errors = [i for i in ISSUES if i[0] == "ERROR"]
+    warns = [i for i in ISSUES if i[0] == "WARN"]
+    if errors or (a.strict and warns):
+        print(f"\nNOT BUILT: {len(errors)} error(s), {len(warns)} warning(s). Fix the items above and run again.")
+        sys.exit(1)
+    if a.check:
+        print(f"\nCheck passed: {len(funds)} fund(s), {len(warns)} warning(s).")
+    else:
+        print(f"\nDone -> {a.out}  ({len(funds) * 3} pages, {len(warns)} warning(s))")
+
+
+if __name__ == "__main__":
+    main()
